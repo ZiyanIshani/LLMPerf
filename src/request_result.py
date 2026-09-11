@@ -24,7 +24,7 @@ class RequestMeasurement:
 
     @property
     def output_tokens_per_second(self) -> float | None:
-        if self.generation_time <= 0 or self.generation_time is None:
+        if self.generation_time is None or self.generation_time <= 0:
             return None
 
         return self.output_tokens / self.generation_time
