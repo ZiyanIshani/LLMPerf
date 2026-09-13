@@ -11,7 +11,7 @@ class RequestMeasurement:
     error: str | None = None
 
     @property
-    def ttft(self) -> float:
+    def ttft(self) -> float | None:
         if self.first_token_time is None:
             return None
         return self.first_token_time - self.request_start_time
