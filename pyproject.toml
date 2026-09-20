@@ -10,13 +10,39 @@ requires-python = ">=3.10"
 dependencies = [
     "click==8.4.2",
     "openai==2.45.0",
+    "pyyaml==6.0.3",
+    "matplotlib==3.11.2",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest==9.1.1",
+    "ruff==0.16.8",
+    "mypy==2.3.1",
 ]
+
+[project.scripts]
+bench = "cli:cli"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
-py-modules = ["cli", "load_generator", "request_result", "stats"]
+py-modules = ["cli", "load_generator", "request_result", "stats", "report"]
+
+[tool.ruff]
+line-length = 110
+src = ["src"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "BLE", "RUF"]
+# BLE001 excluded: blind except is intentional in load_generator.send_request
+# (any failure mode from the client call must land in `error`, not crash the
+# sweep) — see CLAUDE.md V2 revisions.
+# RUF007 excluded: the manual zip() pairwise pattern in stats.inter_token_diffs
+# is intentional, not an itertools.pairwise() oversight — see CLAUDE.md.
+ignore = ["BLE001", "RUF007"]
+
+[tool.mypy]
+python_version = "3.12"
+mypy_path = "src"
+explicit_package_bases = true
+ignore_missing_imports = true

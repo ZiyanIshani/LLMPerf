@@ -1,158 +1,71 @@
-# LLMPerf — V1 Spec
+# CLAUDE.md — Benchmarking CLI
 
-## Context
+Project context and conventions for Claude Code when working in this repo.
+This is a hardware-aware CLI for benchmarking LLM serving endpoints
+(OpenAI-compatible) via concurrency sweeps: TTFT, generation time,
+tokens/sec, error rate, aggregated per concurrency level.
 
-P0 is done and tested: the CLI runs a real sweep against a real endpoint,
-survives failed requests (errors captured, no crash, no silently-zeroed
-metrics), and `--endpoint`/`--model`/`--input-tokens`/`--output` all flow
-through correctly. This spec covers the next pass — turning a working CLI
-into one whose numbers are actually trustworthy and whose repo is usable by
-someone who isn't me.
+## Status
 
-**Still explicitly out of scope:** leaderboard, backend API, database,
-auth-for-a-service, submission flow, Dockerfile, CI, console entry point
-(`pip install .` → `bench`), YAML config for repeatable suites, chart/report
-output. Those are P2+ or the separate leaderboard-pivot direction — don't
-start on them this pass.
+V1 and V2 are both complete (sweep wiring, per-level stats, warm-up,
+per-request timeout, output-token standardization, `report` chart
+command, YAML config, console entry point + Dockerfile, CI, auth
+headers). Overall a strong pass — the schema rename, config-precedence
+handling via `click.ParameterSource`, and the header-values-never-logged
+decision are all correct as implemented. All six V2 revisions below have
+since been resolved; kept here as a record of what they were and how
+each was closed out.
 
-## Before making any changes
+## V2 revisions (resolved)
 
-Read the current state of `cli.py`, `load_generator.py`, and
-`request_result.py` fresh rather than assuming the P0 fixes look a
-particular way — confirm what's actually there before building on top of it.
+1. **Report doesn't visualize the thing item 1 was for (P0). Fixed.**
+   `render_report()` now has a fourth subplot: mean actual output
+   tokens/request with a stdev error bar per concurrency level (see
+   `_render_token_spread_panel()` in `report.py`), so a high tokens/sec
+   number next to a wide error bar is visible at a glance instead of only
+   discoverable by reading the raw JSON.
 
-## V1 scope
+2. **Report command + old results files — untested edge case. Fixed.**
+   `extract_series()` now reads `mean_actual_output_tokens`/
+   `stdev_actual_output_tokens` with `.get()` instead of `[...]`, so a
+   pre-V2 results file (missing those keys) doesn't raise `KeyError` —
+   the token-spread panel renders a "no data" placeholder instead.
+   Covered by `test_extract_series_handles_missing_v2_keys_gracefully`
+   and `test_render_report_handles_pre_v2_results_file` in
+   `tests/test_report.py`.
 
-### 1. Aggregated per-level statistics
+3. **`ignore_eos` was unit-tested, not endpoint-tested. Validated.** Ran
+   real sweeps against local Ollama (`llama3.2`) with
+   `--force-output-tokens`: the endpoint returns `200 OK` and completes
+   normally with `extra_body={"ignore_eos": True}` set — no error, no
+   exception. Confirms the "backend silently ignores unknown extra_body
+   keys" assumption holds for Ollama's OpenAI-compat layer in practice,
+   not just in the fake-client tests.
 
-Right now output is a flat list of per-request measurements per concurrency
-level. Add a summary computed from that raw data — don't discard the raw
-per-request list, add the aggregation alongside it. For each concurrency
-level, compute:
+4. **The zero-vs-null workaround is good, but say so explicitly. Fixed.**
+   Added `test_aggregate_level_real_zero_token_success_is_not_treated_as_error`
+   in `tests/test_stats.py`, which asserts a real success with
+   `actual_tokens=0` is included in the mean (not dropped the way an
+   `error`-carrying request's `actual_tokens=0` is) — pins down that
+   `aggregate_level()` filters on `error`, not `actual_tokens == 0`.
 
-- Mean, p50, p95, p99 TTFT
-- Mean, p50, p95, p99 generation time
-- Aggregate output tokens/sec across all requests at that level (not the
-  average of per-request tokens/sec — total output tokens / total wall time
-  for the level, which is the number that actually reflects throughput)
-- Inter-token latency (mean time between consecutive tokens, from
-  `token_times`)
-- Error rate (failed requests / total requests at that level)
+5. **Ruff scope-down deserves a comment in `pyproject.toml`. Fixed.**
+   `select` now includes `BLE` and `RUF` (previously neither prefix was
+   selected, so the exclusion didn't do anything), with
+   `ignore = ["BLE001", "RUF007"]` and a comment explaining each: BLE001
+   for the intentional blind `except Exception` in
+   `load_generator.send_request`, RUF007 for the intentional manual
+   `zip()` pairwise pattern in `stats.inter_token_diffs`.
 
-Excluding `null` fields correctly from mean/percentile calculations matters
-here — a failed request's `null` TTFT must not become a `0` that drags the
-mean down, which is the same class of bug P0 already fixed at the
-per-request level. Compute stats only over requests where the relevant
-field is non-null, and report the error rate separately so a level with a
-high failure rate doesn't quietly hide it by only showing survivors' stats.
+6. **Docker is an open item, not a done one. Closed.** `docker build .`
+   run for real (image `llmperf`), plus `docker run llmperf` and
+   `docker run llmperf report --help` to confirm the `bench` entry point
+   actually works inside the container, not just that the image builds.
 
-### 2. Warm-up phase
+## Working style notes
 
-The first request in any sweep model-loads on a cold Ollama instance —
-confirmed in testing, where request 1's TTFT was ~3.8s vs. request 2's
-~0.05s, purely from cold start. Add a warm-up: fire one (or a small
-configurable number of) throwaway request(s) against the endpoint before
-the timed sweep begins, discard their results entirely, and don't include
-them in the output JSON at all. Make sure the warm-up request actually
-targets the same model that's about to be swept.
-
-### 3. Prompt sizing / dataset input
-
-Currently `--input-tokens` is unused and the prompt is a fixed string.
-Either:
-
-- (a) generate a prompt sized to roughly match `--input-tokens` (tokenize
-  and pad/truncate, or repeat filler text to hit an approximate token
-  count), or
-- (b) accept a `--prompt-file` / dataset path as an alternative to
-  `--input-tokens`, sampling real prompts from it.
-
-Pick (a) if you want simplicity and consistency across runs; pick (b) if
-you want realistic prompt content. Either way, record the actual prompt (or
-a summary of it — length, source) in the output JSON so results are
-reproducible and explainable.
-
-### 4. Per-request timeout
-
-Add a configurable per-request timeout (e.g. `--request-timeout` in
-seconds, sensible default). A hung request currently could stall a whole
-concurrency level indefinitely. A timed-out request should look like any
-other error case — captured in `error`, metrics `null`, sweep continues —
-not a special code path.
-
-### 5. Auth headers / multiple prompts (if time allows)
-
-Support an `--api-key` flag or env var (currently `"ollama"` is
-hardcoded — fine for local testing, not fine for anything else) and,
-optionally, allow more than one prompt/dataset entry to be sampled across
-requests rather than sending the identical prompt every time.
-
-### 6. Hardening
-
-- `pyproject.toml` (or `requirements.txt`) with pinned dependency versions.
-- Unit tests for the aggregation/statistics logic at minimum (this is the
-  new logic most likely to have a subtle bug — e.g. percentile calculation
-  on an empty or all-null list — and it's cheap to test since it's pure
-  computation, no live endpoint needed). A mock-server integration test for
-  the full sweep is a good addition if time allows, not required for V1.
-- Replace any remaining `print()` calls with `logging`, with a `--verbose`
-  or log-level flag.
-
-## Definition of done for V1
-
-- A sweep against a real endpoint produces, per concurrency level, both the
-  raw per-request list (as today) and a stats summary (mean/p50/p95/p99
-  TTFT and generation time, aggregate tokens/sec, inter-token latency,
-  error rate).
-- The first real (non-warm-up) request in the output no longer shows an
-  inflated cold-start TTFT.
-- A run with `--input-tokens 500` vs. `--input-tokens 50` visibly differs
-  in prompt size / recorded prompt metadata.
-- A hung endpoint doesn't stall the sweep past the configured timeout.
-- `pip install -e .` (or equivalent) from a clean clone installs pinned
-  deps with no version drift surprises.
-- Aggregation logic has unit tests that pass, including at least one case
-  with some `null` fields mixed into the data (proving nulls are excluded
-  correctly, not treated as zero).
-
-## Deliverables alongside the code
-
-### README update
-
-Update the README's status section to reflect V1 — move P0 items from "in
-progress" to done, describe the new stats output and warm-up behavior, and
-update or add a real sample output snippet from an actual run (not
-fabricated numbers). Keep the honest-status framing from the original
-README draft — don't overclaim finished features.
-
-### Change log file
-
-Create `CHANGES-v1.md` (or similar — pick a clear name) documenting this
-pass, structured as:
-
-```markdown
-# V1 Changes
-
-## Files created
-
-- `path/to/new_file.py` — one or two sentences on what it does and why it
-  was added.
-
-## Files changed
-
-- `path/to/existing_file.py` — one or two sentences per meaningful change
-  (not a line-by-line diff restatement). Group related changes in one
-  entry rather than listing every touched line separately.
-
-## Summary
-
-A few sentences on what V1 actually accomplished, framed against the V1
-scope above — what's done, what (if anything) from this spec was
-deliberately deferred and why.
-```
-
-This file is for me to review what actually happened in a session without
-re-reading every diff — keep it accurate to the real changes, not a
-restatement of this spec's intentions. If something in this spec turned out
-to be wrong or need a different approach once you were in the code, note
-that here too rather than silently deviating.
+- Independent-builder preference: write implementations directly; use
+  Claude for targeted guidance on specific blockers, not full code
+  generation.
+- Prefers direct, candid technical evaluation over flattery — call out
+  confounds, bugs, and scope creep plainly.

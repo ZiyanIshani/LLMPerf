@@ -1,6 +1,6 @@
 import math
 
-from stats import aggregate_level, inter_token_diffs, mean, percentile
+from stats import aggregate_level, inter_token_diffs, mean, percentile, stdev
 
 
 def test_mean_basic():
@@ -36,14 +36,55 @@ def test_inter_token_diffs_fewer_than_two_points():
     assert inter_token_diffs([1.0]) == []
 
 
-def _request(ttft=None, generation_time=None, output_tokens=0, error=None, token_times=None):
+def _request(ttft=None, generation_time=None, actual_tokens=0, error=None, token_times=None):
     return {
         "ttft": ttft,
         "generation_time": generation_time,
-        "output_tokens": output_tokens,
+        "actual_tokens": actual_tokens,
         "error": error,
         "token_times": token_times or [],
     }
+
+
+def test_stdev_fewer_than_two_points_is_none():
+    assert stdev([]) is None
+    assert stdev([5]) is None
+
+
+def test_stdev_known_values():
+    assert math.isclose(stdev([2, 4, 4, 4, 5, 5, 7, 9]), 2.13809, rel_tol=1e-4)
+
+
+def test_aggregate_level_mean_actual_output_tokens_excludes_failures():
+    # A failed request's actual_tokens is a failure artifact (0), not a real
+    # short generation, so it must not pull down the mean/stdev of actual
+    # generation length the way a null ttft must not pull down its mean.
+    requests = [
+        _request(ttft=1.0, generation_time=1.0, actual_tokens=100),
+        _request(ttft=1.0, generation_time=1.0, actual_tokens=200),
+        _request(error="connection reset"),
+    ]
+    stats = aggregate_level(requests, wall_time_sec=10.0)
+    assert stats["mean_actual_output_tokens"] == 150
+    assert stats["stdev_actual_output_tokens"] is not None
+
+
+def test_aggregate_level_real_zero_token_success_is_not_treated_as_error():
+    # The zero-vs-null distinction this guards: a request that succeeds
+    # (error is None) but the model emits zero tokens is a real 0, and must
+    # be *included* in the actual-tokens distribution — filtering must key
+    # off `error`, not `actual_tokens == 0`, or this case would silently
+    # get dropped the same way a failure's actual_tokens=0 must be.
+    requests = [
+        _request(ttft=1.0, generation_time=0.5, actual_tokens=0, error=None),
+        _request(ttft=1.0, generation_time=0.5, actual_tokens=100, error=None),
+    ]
+    stats = aggregate_level(requests, wall_time_sec=10.0)
+    assert stats["error_count"] == 0
+    assert stats["error_rate"] == 0.0
+    # mean of [0, 100], not [100] (which it would be if actual_tokens == 0
+    # were mistakenly used as the filter instead of error)
+    assert stats["mean_actual_output_tokens"] == 50
 
 
 def test_aggregate_level_empty_requests():
@@ -56,6 +97,8 @@ def test_aggregate_level_empty_requests():
     # Zero tokens over a real wall-clock window is a legitimate 0.0, not an
     # undefined value — undefined only when wall_time itself is missing/zero.
     assert stats["aggregate_output_tokens_per_sec"] == 0.0
+    assert stats["mean_actual_output_tokens"] is None
+    assert stats["stdev_actual_output_tokens"] is None
     assert stats["inter_token_latency_mean_sec"] is None
 
 
@@ -63,8 +106,8 @@ def test_aggregate_level_excludes_nulls_not_zero():
     # A failed request contributes a null ttft/generation_time, which must
     # be excluded from the mean rather than counted as 0 (P0-class bug).
     requests = [
-        _request(ttft=1.0, generation_time=2.0, output_tokens=10, token_times=[0.1, 0.2, 0.3]),
-        _request(ttft=3.0, generation_time=4.0, output_tokens=20, token_times=[0.1, 0.3, 0.5]),
+        _request(ttft=1.0, generation_time=2.0, actual_tokens=10, token_times=[0.1, 0.2, 0.3]),
+        _request(ttft=3.0, generation_time=4.0, actual_tokens=20, token_times=[0.1, 0.3, 0.5]),
         _request(error="connection reset"),  # ttft/generation_time both None
     ]
     stats = aggregate_level(requests, wall_time_sec=10.0)
@@ -87,13 +130,14 @@ def test_aggregate_level_all_errors():
     assert stats["ttft_sec"]["mean"] is None
     assert stats["generation_time_sec"]["mean"] is None
     assert stats["aggregate_output_tokens_per_sec"] == 0.0
+    assert stats["mean_actual_output_tokens"] is None
     assert stats["inter_token_latency_mean_sec"] is None
 
 
 def test_aggregate_level_inter_token_latency():
     requests = [
-        _request(ttft=0.1, generation_time=1.0, output_tokens=3, token_times=[0.1, 0.3, 0.6]),
-        _request(ttft=0.1, generation_time=1.0, output_tokens=2, token_times=[0.1, 0.2]),
+        _request(ttft=0.1, generation_time=1.0, actual_tokens=3, token_times=[0.1, 0.3, 0.6]),
+        _request(ttft=0.1, generation_time=1.0, actual_tokens=2, token_times=[0.1, 0.2]),
     ]
     stats = aggregate_level(requests, wall_time_sec=2.0)
     # diffs: [0.2, 0.3] from request 1, [0.1] from request 2 -> mean of [0.2, 0.3, 0.1]

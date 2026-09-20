@@ -6,13 +6,22 @@ to unit test without a live endpoint.
 from __future__ import annotations
 
 import math
-from typing import Sequence
+from collections.abc import Sequence
 
 
 def mean(values: Sequence[float]) -> float | None:
     if not values:
         return None
     return sum(values) / len(values)
+
+
+def stdev(values: Sequence[float]) -> float | None:
+    """Sample standard deviation. None below two points — undefined, not 0."""
+    if len(values) < 2:
+        return None
+    avg = sum(values) / len(values)
+    variance = sum((v - avg) ** 2 for v in values) / (len(values) - 1)
+    return math.sqrt(variance)
 
 
 def percentile(values: Sequence[float], pct: float) -> float | None:
@@ -65,8 +74,13 @@ def aggregate_level(requests: list[dict], wall_time_sec: float) -> dict:
     generation_values = [
         r["generation_time"] for r in requests if r.get("generation_time") is not None
     ]
+    # Actual generation length only makes sense as a distribution over
+    # requests that actually completed — a failed request's 0 tokens is a
+    # failure artifact, not a short generation, so it's excluded here the
+    # same way a null ttft/generation_time is excluded above.
+    actual_tokens_values = [r["actual_tokens"] for r in requests if r.get("error") is None]
 
-    total_output_tokens = sum(r.get("output_tokens") or 0 for r in requests)
+    total_output_tokens = sum(r.get("actual_tokens") or 0 for r in requests)
     aggregate_output_tokens_per_sec = (
         total_output_tokens / wall_time_sec if wall_time_sec and wall_time_sec > 0 else None
     )
@@ -83,5 +97,7 @@ def aggregate_level(requests: list[dict], wall_time_sec: float) -> dict:
         "ttft_sec": _distribution(ttft_values),
         "generation_time_sec": _distribution(generation_values),
         "aggregate_output_tokens_per_sec": aggregate_output_tokens_per_sec,
+        "mean_actual_output_tokens": mean(actual_tokens_values),
+        "stdev_actual_output_tokens": stdev(actual_tokens_values),
         "inter_token_latency_mean_sec": mean(all_inter_token_diffs),
     }

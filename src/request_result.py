@@ -1,4 +1,5 @@
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
+
 
 @dataclass
 class RequestMeasurement:
@@ -7,7 +8,8 @@ class RequestMeasurement:
     first_token_time: float | None
     completion_time: float | None
     token_times: list[float]
-    output_tokens: int
+    requested_output_tokens: int
+    actual_tokens: int
     error: str | None = None
 
     @property
@@ -27,7 +29,7 @@ class RequestMeasurement:
         if self.generation_time is None or self.generation_time <= 0:
             return None
 
-        return self.output_tokens / self.generation_time
+        return self.actual_tokens / self.generation_time
     
     def to_dict(self) -> dict:
         return {
